@@ -28,6 +28,7 @@ Usage:
 import re
 import os
 import sys
+import csv
 import time
 import base64
 import sqlite3
@@ -631,6 +632,144 @@ def find_website_for_business(business_name, city='Chicago'):
 
 
 # ═══════════════════════════════════════════════════════════════
+# GOOGLE SHEETS LIVE SYNC
+# ═══════════════════════════════════════════════════════════════
+
+def sync_to_google_sheets(conn, sheet_target):
+    """
+    Synchronizuje všechny leady s emailem přímo do Google Tabulky přes Google Sheets API.
+    sheet_target: ID tabulky nebo celé URL tabulky.
+    """
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        os.system('pip install gspread google-auth --break-system-packages -q')
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+    creds_file = '/home/q/.gemini/credentials/service_account.json'
+    if not os.path.exists(creds_file):
+        print(f"⚠ Soubor credentials nenalezen: {creds_file}")
+        return False
+
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    creds = Credentials.from_service_account_file(creds_file, scopes=scopes)
+    gc = gspread.authorize(creds)
+
+    # Otevřít tabulku
+    try:
+        if 'docs.google.com' in sheet_target:
+            sh = gc.open_by_url(sheet_target)
+        else:
+            sh = gc.open_by_key(sheet_target)
+    except Exception as e:
+        print(f"\n❌ Nelze otevřít Google Tabulku: {e}")
+        print(f"👉 Ujistěte se, že jste tabulku nasdíleli pro úpravy (Editor) na:")
+        print(f"   antigravity@wild-ga4-6318.iam.gserviceaccount.com\n")
+        return False
+
+    c = conn.cursor()
+    c.execute('''
+        SELECT business_name, owner_name, niche, email, phone, website,
+               outdated_score, technical_flaws, doctype, has_ssl,
+               is_mobile_friendly, copyright_year, technology,
+               website_age_indicator, address, city, state, zip_code,
+               status, created_at
+        FROM leads
+        WHERE email != '' AND email IS NOT NULL
+        ORDER BY outdated_score DESC, created_at DESC
+    ''')
+    rows = c.fetchall()
+
+    headers = [
+        'Firma', 'Majitel / Zástupce', 'Obor', 'Ověřený Email', 'Telefon', 'Web',
+        'Stáří Kódu (0-100)', 'Technické Vady Webu', 'Doctype', 'SSL?',
+        'Responzivní?', 'Rok Copyrightu', 'Technologie', 'Kategorie Stáří',
+        'Adresa', 'Město', 'Stát', 'ZIP', 'Status', 'Nalezeno'
+    ]
+
+    # 1. List: 🔥 Hot Outdated Leads
+    hot_data = [headers]
+    for r in rows:
+        if (r[6] or 0) >= 25:
+            hot_data.append([str(x) if x is not None else '' for x in r])
+
+    try:
+        ws_hot = sh.worksheet('🔥 Hot Outdated Leads')
+    except gspread.WorksheetNotFound:
+        ws_hot = sh.add_worksheet(title='🔥 Hot Outdated Leads', rows=100, cols=25)
+
+    ws_hot.clear()
+    ws_hot.update(hot_data, 'A1')
+
+    # 2. List: Všechny s Emailem
+    all_data = [headers]
+    for r in rows:
+        all_data.append([str(x) if x is not None else '' for x in r])
+
+    try:
+        ws_all = sh.worksheet('Všechny s Emailem')
+    except gspread.WorksheetNotFound:
+        ws_all = sh.add_worksheet(title='Všechny s Emailem', rows=200, cols=25)
+
+    ws_all.clear()
+    ws_all.update(all_data, 'A1')
+
+    print(f"\n✅ Úspěšně synchronizováno do Google Tabulky:")
+    print(f"   URL: {sh.url}")
+    print(f"   📊 Zapsáno {len(rows)} leadů s emailem ({len(hot_data)-1} 🔥 Hot Leady)")
+    return True
+
+
+def export_csv_for_gsheet(conn):
+    """Exportuje CSV soubory pro okamžitý 1-klik import do Google Tabulek přes =IMPORTDATA."""
+    c = conn.cursor()
+    c.execute('''
+        SELECT business_name, owner_name, niche, email, phone, website,
+               outdated_score, technical_flaws, doctype, has_ssl,
+               is_mobile_friendly, copyright_year, technology,
+               website_age_indicator, address, city, state, zip_code,
+               status, created_at
+        FROM leads
+        WHERE email != '' AND email IS NOT NULL
+        ORDER BY outdated_score DESC, created_at DESC
+    ''')
+    rows = c.fetchall()
+
+    headers = [
+        'Firma', 'Majitel', 'Obor', 'Email', 'Telefon', 'Web',
+        'Skore_Stari', 'Technicke_Vady', 'Doctype', 'SSL',
+        'Responzivni', 'Copyright', 'Technologie', 'Kategorie',
+        'Adresa', 'Mesto', 'Stat', 'ZIP', 'Status', 'Nalezeno'
+    ]
+
+    base_dir = os.path.dirname(DB_PATH)
+    hot_csv_path = os.path.join(base_dir, 'leads_hot.csv')
+    all_csv_path = os.path.join(base_dir, 'leads_all.csv')
+
+    with open(all_csv_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for r in rows:
+            w.writerow(r)
+
+    with open(hot_csv_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for r in rows:
+            if (r[6] or 0) >= 25:
+                w.writerow(r)
+
+    print(f"  📄 Vygenerována CSV data pro Google Sheets:")
+    print(f"     - {hot_csv_path}")
+    print(f"     - {all_csv_path}")
+
+
+# ═══════════════════════════════════════════════════════════════
 # EXCEL EXPORT (Focus on Outdated Code & Flaws)
 # ═══════════════════════════════════════════════════════════════
 
@@ -879,6 +1018,7 @@ def run_pipeline(mode='search', city='Chicago, IL', niche='roofing', limit_or_pa
     print(f'{"="*65}\n')
 
     export_to_excel(conn)
+    export_csv_for_gsheet(conn)
     conn.close()
 
 
@@ -889,14 +1029,22 @@ def main():
     parser.add_argument('--niche', type=str, default='roofing', help='Obor (výchozí: "roofing")')
     parser.add_argument('--pages', type=int, default=3, help='Počet stránek/dotazů (pro search)')
     parser.add_argument('--limit', type=int, default=25, help='Limit firem (pro gov režim)')
-    parser.add_argument('--export', action='store_true', help='Exportovat DB do Excelu')
+    parser.add_argument('--export', action='store_true', help='Exportovat DB do Excelu a CSV pro Google Sheets')
     parser.add_argument('--stats', action='store_true', help='Zobrazit statistiky DB')
+    parser.add_argument('--gsheet', type=str, help='ID nebo URL Google Tabulky pro přímou live synchronizaci')
 
     args = parser.parse_args()
+
+    if args.gsheet:
+        conn = init_db()
+        sync_to_google_sheets(conn, args.gsheet)
+        conn.close()
+        return
 
     if args.export:
         conn = init_db()
         export_to_excel(conn)
+        export_csv_for_gsheet(conn)
         conn.close()
         return
 
