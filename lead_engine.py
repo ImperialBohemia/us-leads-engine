@@ -693,21 +693,7 @@ def sync_to_google_sheets(conn, sheet_target):
         'Adresa', 'Město', 'Stát', 'ZIP', 'Status', 'Nalezeno'
     ]
 
-    # 1. List: 🔥 Hot Outdated Leads
-    hot_data = [headers]
-    for r in rows:
-        if (r[6] or 0) >= 25:
-            hot_data.append([str(x) if x is not None else '' for x in r])
-
-    try:
-        ws_hot = sh.worksheet('🔥 Hot Outdated Leads')
-    except gspread.WorksheetNotFound:
-        ws_hot = sh.add_worksheet(title='🔥 Hot Outdated Leads', rows=100, cols=25)
-
-    ws_hot.clear()
-    ws_hot.update(hot_data, 'A1')
-
-    # 2. List: Všechny s Emailem
+    # 1. Plná data pro obě záložky (seřazeno dle zastaralosti)
     all_data = [headers]
     for r in rows:
         all_data.append([str(x) if x is not None else '' for x in r])
@@ -715,10 +701,18 @@ def sync_to_google_sheets(conn, sheet_target):
     try:
         ws_all = sh.worksheet('Všechny s Emailem')
     except gspread.WorksheetNotFound:
-        ws_all = sh.add_worksheet(title='Všechny s Emailem', rows=200, cols=25)
+        ws_all = sh.add_worksheet(title='Všechny s Emailem', rows=len(all_data)+20, cols=25)
 
     ws_all.clear()
     ws_all.update(all_data, 'A1')
+
+    try:
+        ws_hot = sh.worksheet('🔥 Hot Outdated Leads')
+    except gspread.WorksheetNotFound:
+        ws_hot = sh.add_worksheet(title='🔥 Hot Outdated Leads', rows=len(all_data)+20, cols=25)
+
+    ws_hot.clear()
+    ws_hot.update(all_data, 'A1')
 
     # Automatické formátování: vše zarovnat vlevo, text wrap a optimální responzivní šířky sloupců
     try:
@@ -745,7 +739,8 @@ def sync_to_google_sheets(conn, sheet_target):
             140,  # Nalezeno
         ]
         format_requests = []
-        for ws, data_len in [(ws_hot, len(hot_data)), (ws_all, len(all_data))]:
+        for ws in [ws_hot, ws_all]:
+            data_len = len(all_data)
             format_requests.append({
                 'repeatCell': {
                     'range': {
