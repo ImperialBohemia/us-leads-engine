@@ -374,6 +374,7 @@ def clean_email(email):
 
 
 def find_emails_from_site(base_url, timeout=7):
+    import html as html_module
     if not base_url:
         return []
     if not base_url.startswith('http'):
@@ -383,20 +384,40 @@ def find_emails_from_site(base_url, timeout=7):
     pages_to_check = [base_url]
     visited = set()
     email_regex = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}')
+    obfuscated_regex = re.compile(r'([a-zA-Z0-9_.+-]+)\s*(?:\[at\]|\(at\))\s*([a-zA-Z0-9-]+\.[a-zA-Z]{2,})', re.IGNORECASE)
 
     try:
-        html, _ = fetch_page(base_url, timeout=timeout)
-        if not html:
+        raw_html, _ = fetch_page(base_url, timeout=timeout)
+        if not raw_html:
             return []
 
-        for m in email_regex.findall(html):
+        decoded_html = html_module.unescape(raw_html)
+        soup = BeautifulSoup(decoded_html, 'html.parser')
+
+        # 1. Direct mailto: links
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            if href.lower().startswith('mailto:'):
+                clean_target = href[7:].split('?')[0].strip()
+                clean_target = urllib.parse.unquote(clean_target)
+                c = clean_email(clean_target)
+                if c:
+                    emails.add(c)
+
+        # 2. Regex on decoded HTML
+        for m in email_regex.findall(decoded_html):
             c = clean_email(m)
             if c:
                 emails.add(c)
 
-        soup = BeautifulSoup(html, 'html.parser')
-        contact_keywords = ['contact', 'about', 'reach', 'touch', 'email', 'quote', 'estimate']
+        # 3. Obfuscated [at] / (at)
+        for user_part, dom_part in obfuscated_regex.findall(decoded_html):
+            c = clean_email(f'{user_part}@{dom_part}')
+            if c:
+                emails.add(c)
 
+        # 4. Find contact subpages
+        contact_keywords = ['contact', 'about', 'reach', 'touch', 'email', 'quote', 'estimate']
         for a in soup.find_all('a', href=True):
             href = a['href'].lower()
             text = a.get_text(' ', strip=True).lower()
@@ -415,10 +436,26 @@ def find_emails_from_site(base_url, timeout=7):
             break
         visited.add(page)
         try:
-            html, _ = fetch_page(page, timeout=timeout)
-            if html:
-                for m in email_regex.findall(html):
+            raw_html, _ = fetch_page(page, timeout=timeout)
+            if raw_html:
+                decoded_html = html_module.unescape(raw_html)
+                sub_soup = BeautifulSoup(decoded_html, 'html.parser')
+                for a in sub_soup.find_all('a', href=True):
+                    href = a['href'].strip()
+                    if href.lower().startswith('mailto:'):
+                        clean_target = href[7:].split('?')[0].strip()
+                        clean_target = urllib.parse.unquote(clean_target)
+                        c = clean_email(clean_target)
+                        if c:
+                            emails.add(c)
+
+                for m in email_regex.findall(decoded_html):
                     c = clean_email(m)
+                    if c:
+                        emails.add(c)
+
+                for user_part, dom_part in obfuscated_regex.findall(decoded_html):
+                    c = clean_email(f'{user_part}@{dom_part}')
                     if c:
                         emails.add(c)
         except Exception:
@@ -602,6 +639,7 @@ def export_to_excel(conn, filepath=None):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     c = conn.cursor()
+    # STRICT FILTER: Pouze leady s ověřeným emailem
     c.execute('''
         SELECT business_name, owner_name, niche, email, phone, website,
                outdated_score, technical_flaws, doctype, has_ssl,
@@ -609,8 +647,8 @@ def export_to_excel(conn, filepath=None):
                website_age_indicator, address, city, state, zip_code,
                status, created_at
         FROM leads
+        WHERE email != '' AND email IS NOT NULL
         ORDER BY
-            CASE WHEN email != '' THEN 0 ELSE 1 END,
             outdated_score DESC,
             created_at DESC
     ''')
@@ -622,12 +660,12 @@ def export_to_excel(conn, filepath=None):
 
     wb = Workbook()
 
-    # Sheet 1: ALL LEADS
+    # Sheet 1: VŠECHNY LEADY S EMAILEM
     ws = wb.active
-    ws.title = 'Všechny Leady'
+    ws.title = 'Všechny s Emailem'
 
     headers = [
-        'Firma', 'Majitel / Zástupce', 'Obor', 'Email', 'Telefon', 'Web',
+        'Firma', 'Majitel / Zástupce', 'Obor', 'Ověřený Email', 'Telefon', 'Web',
         'Stáří Kódu (0-100)', 'Technické Vady Webu', 'Doctype', 'SSL?',
         'Responzivní?', 'Rok Copyrightu', 'Technologie', 'Kategorie Stáří',
         'Adresa', 'Město', 'Stát', 'ZIP', 'Status', 'Nalezeno'
@@ -797,26 +835,23 @@ def run_pipeline(mode='search', city='Chicago, IL', niche='roofing', limit_or_pa
         else:
             print(f'       ✨ Moderní kód (žádné kritické vady)')
 
-        # 2. Hledání emailu
+    # 2. Hledání emailu (BEZ EMAILU NEBEREM)
         emails = find_emails_from_site(url)
         email = emails[0] if emails else ''
 
-        if email:
-            print(f'       📬 Email: {email}')
-        else:
-            print(f'       ❌ Email nenalezen')
+        if not email:
+            print(f'       ❌ Bez emailu -> VYŘAZENO (bez emailu nebereme)')
+            continue
+
+        print(f'       📬 Ověřený Email: {email}')
 
         # 3. Status
-        if email and score >= 25:
+        if score >= 25:
             status = 'HOT_LEAD'
             total_hot += 1
             print(f'       🔥🔥🔥 HOT PROSPECT!')
-        elif score >= 25:
-            status = 'OUTDATED_NO_EMAIL'
-        elif email:
-            status = 'MODERN_WITH_EMAIL'
         else:
-            status = 'MODERN_NO_EMAIL'
+            status = 'MODERN_WITH_EMAIL'
 
         lead_record = {
             **biz,
