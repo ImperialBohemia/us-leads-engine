@@ -43,6 +43,7 @@ import requests
 # ═══════════════════════════════════════════════════════════════
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'leads.db')
+DEFAULT_GSHEET_ID = '103xx08GvIeH9WvtmUvoxlOWfWv0CT2Bh2HVfnWsvIws'
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -1019,6 +1020,7 @@ def run_pipeline(mode='search', city='Chicago, IL', niche='roofing', limit_or_pa
 
     export_to_excel(conn)
     export_csv_for_gsheet(conn)
+    sync_to_google_sheets(conn, DEFAULT_GSHEET_ID)
     conn.close()
 
 
