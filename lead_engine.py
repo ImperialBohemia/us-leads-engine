@@ -1,14 +1,26 @@
 """
-US Local Business Lead Engine v3.1
-===================================
-Precision multi-source lead engine for finding US businesses with outdated websites.
+US Local Business Lead Engine v4.0 (Outdated Web Precision Detector)
+=====================================================================
+Specialized engine for detecting objectively outdated US business websites.
 
-Search Engine: Yahoo Search (unblocked, direct organic extraction)
-Pipeline: Yahoo Search → Filter Aggregators → Visit Sites → Extract Emails/Phones → Web Audit → SQLite DB → Formatted Excel
+Audit Criteria for Outdated Code:
+  1. DOCTYPE: HTML 4.01, XHTML, or Quirks Mode (+25 pts)
+  2. Mobile Failure: Missing <meta name="viewport"> (+30 pts)
+  3. Archaic Layout: Table-based layout (cellpadding/bgcolor) (+20 pts)
+  4. Deprecated Tags: <font>, <center>, <marquee>, <frameset> (+15-30 pts)
+  5. Security: No SSL / Insecure HTTP (+20 pts)
+  6. Dead Media: Adobe Flash (.swf / shockwave) (+35 pts)
+  7. Fixed Width: Hardcoded 960px-1024px desktop container (+15 pts)
+  8. Ancient Copyright: <= 2015 (+30 pts), <= 2019 (+20 pts), <= 2022 (+10 pts)
+  9. Obsolete Libraries: Ancient jQuery 1.x, FrontPage generator (+15-30 pts)
+
+Data Sources:
+  - Source A: Chicago Open Data Portal (Official Licensed Contractors API)
+  - Source B: Yahoo Search (organic direct crawling)
 
 Usage:
-  python3 lead_engine.py --city "Chicago, IL" --niche "roofing" --pages 3
-  python3 lead_engine.py --city "Dallas, TX" --niche "hvac" --pages 5
+  python3 lead_engine.py --mode gov --niche "roofing" --limit 30
+  python3 lead_engine.py --mode search --city "Chicago, IL" --niche "roofing" --pages 3
   python3 lead_engine.py --export
   python3 lead_engine.py --stats
 """
@@ -16,20 +28,17 @@ Usage:
 import re
 import os
 import sys
-import csv
-import json
 import time
 import base64
 import sqlite3
 import argparse
-import urllib.request
 import urllib.parse
 from datetime import datetime
 from bs4 import BeautifulSoup
 import requests
 
 # ═══════════════════════════════════════════════════════════════
-# CONFIG & DIRECTORY CONSTANTS
+# CONFIG
 # ═══════════════════════════════════════════════════════════════
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'leads.db')
@@ -38,7 +47,6 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate',
     'Connection': 'keep-alive',
 }
 
@@ -59,7 +67,9 @@ SKIP_DOMAINS = {
     'local.com', 'showmelocal.com', 'brownbook.net', 'cylex.us.com',
     'finduslocal.com', 'n49.com', 'tupalo.com', 'fyple.com', 'here.com',
     'roof.info', 'crca.org', 'ontoplist.com', 'uservoice.com', 'guce.yahoo.com',
+    'chicago.gov', 'illinois.gov', 'gov', 'edu',
 }
+
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
@@ -82,20 +92,19 @@ def init_db():
             city TEXT DEFAULT '',
             state TEXT DEFAULT '',
             zip_code TEXT DEFAULT '',
-            years_in_business TEXT DEFAULT '',
-            rating TEXT DEFAULT '',
-            review_count TEXT DEFAULT '',
-            website_age_indicator TEXT DEFAULT '',
+            outdated_score INTEGER DEFAULT 0,
+            technical_flaws TEXT DEFAULT '',
+            doctype TEXT DEFAULT '',
             has_ssl INTEGER DEFAULT 0,
             is_mobile_friendly INTEGER DEFAULT -1,
-            page_speed_score INTEGER DEFAULT -1,
             copyright_year TEXT DEFAULT '',
             technology TEXT DEFAULT '',
+            website_age_indicator TEXT DEFAULT '',
             status TEXT DEFAULT 'NEW',
             preview_url TEXT DEFAULT '',
             contacted_at TEXT DEFAULT '',
             notes TEXT DEFAULT '',
-            source TEXT DEFAULT 'yahoo',
+            source TEXT DEFAULT 'search',
             scan_city TEXT DEFAULT '',
             scan_niche TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now'))
@@ -109,6 +118,8 @@ def init_db():
             niche TEXT,
             results_found INTEGER DEFAULT 0,
             new_leads INTEGER DEFAULT 0,
+            hot_leads INTEGER DEFAULT 0,
+            source TEXT DEFAULT 'search',
             scanned_at TEXT DEFAULT (datetime('now'))
         )
     ''')
@@ -141,7 +152,7 @@ def insert_lead(conn, data):
             INSERT INTO leads (
                 business_name, owner_name, niche, website, domain,
                 email, phone, address, city, state, zip_code,
-                years_in_business, rating, review_count,
+                outdated_score, technical_flaws, doctype,
                 has_ssl, is_mobile_friendly, copyright_year,
                 technology, website_age_indicator, status,
                 source, scan_city, scan_niche
@@ -158,16 +169,16 @@ def insert_lead(conn, data):
             data.get('city', ''),
             data.get('state', ''),
             data.get('zip_code', ''),
-            data.get('years_in_business', ''),
-            data.get('rating', ''),
-            data.get('review_count', ''),
+            data.get('outdated_score', 0),
+            data.get('technical_flaws', ''),
+            data.get('doctype', ''),
             data.get('has_ssl', 0),
             data.get('is_mobile_friendly', -1),
             data.get('copyright_year', ''),
             data.get('technology', ''),
             data.get('website_age_indicator', ''),
             data.get('status', 'NEW'),
-            data.get('source', 'yahoo'),
+            data.get('source', 'search'),
             data.get('scan_city', ''),
             data.get('scan_niche', ''),
         ))
@@ -178,105 +189,170 @@ def insert_lead(conn, data):
 
 
 # ═══════════════════════════════════════════════════════════════
-# YAHOO SEARCH SCRAPER
+# ADVANCED OUTDATED CODE AUDIT ENGINE
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_page(url, timeout=8):
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-        return r.text
+        return r.text, r.url
     except Exception:
-        return None
+        return None, url
 
 
-def is_business_domain(domain):
-    if not domain or len(domain) < 4 or '.' not in domain:
-        return False
-    domain = domain.lower().replace('www.', '')
-    for skip in SKIP_DOMAINS:
-        if skip in domain:
-            return False
-    return True
+def audit_website_code(url, timeout=8):
+    """
+    Rigorously detects whether a website uses archaic or outdated web code.
+    Returns score (0-100+), technical flaws list, and specific indicators.
+    """
+    audit = {
+        'outdated_score': 0,
+        'technical_flaws': '',
+        'doctype': 'HTML5',
+        'has_ssl': 0,
+        'is_mobile_friendly': 1,
+        'copyright_year': '',
+        'technology': '',
+        'website_age_indicator': 'MODERN',
+        'phone': '',
+    }
 
+    if not url:
+        return audit
 
-def search_yahoo(city, niche, max_pages=3):
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    found_leads = {}
+    if not url.startswith('http'):
+        url = 'http://' + url
 
-    queries = [
-        f'{niche} contractors {city}',
-        f'{niche} company {city}',
-        f'commercial residential {niche} {city}',
-    ]
+    html, final_url = fetch_page(url, timeout=timeout)
+    if not html:
+        return audit
 
-    for q_idx, query in enumerate(queries[:max_pages]):
-        for p in range(max_pages):
-            b_offset = p * 10 + 1
-            encoded = urllib.parse.quote_plus(query)
-            url = f'https://search.yahoo.com/search?p={encoded}&b={b_offset}'
-            print(f'  🔍 Yahoo Search: "{query}" (p.{p+1})')
+    html_lower = html.lower()
+    flaws = []
+    score = 0
 
-            try:
-                r = session.get(url, timeout=10)
-                if r.status_code != 200:
-                    break
+    # 1. SSL / Security check
+    if final_url.startswith('https://'):
+        audit['has_ssl'] = 1
+    else:
+        score += 20
+        flaws.append('No SSL (Insecure HTTP)')
 
-                soup = BeautifulSoup(r.text, 'html.parser')
-                page_found = 0
+    # 2. DOCTYPE analysis (Quirks vs Standards)
+    snippet_start = html_lower[:300]
+    if '<!doctype html>' in snippet_start:
+        audit['doctype'] = 'HTML5'
+    elif 'html 4.01 transitional' in snippet_start:
+        audit['doctype'] = 'HTML 4.01 Transitional'
+        score += 25
+        flaws.append('Archaic HTML 4.01 DOCTYPE')
+    elif 'xhtml 1.0' in snippet_start:
+        audit['doctype'] = 'XHTML 1.0'
+        score += 20
+        flaws.append('Old XHTML 1.0 DOCTYPE')
+    elif '<!doctype' not in snippet_start:
+        audit['doctype'] = 'Missing DOCTYPE'
+        score += 25
+        flaws.append('Missing DOCTYPE (Quirks Mode)')
 
-                for a in soup.find_all('a', href=True):
-                    href = a['href']
-                    title = a.get_text(strip=True)
-                    final_url = None
+    # 3. Mobile responsiveness (<meta name="viewport">)
+    if 'name="viewport"' in html_lower or "name='viewport'" in html_lower:
+        audit['is_mobile_friendly'] = 1
+    else:
+        audit['is_mobile_friendly'] = 0
+        score += 30
+        flaws.append('No Mobile Viewport (Unresponsive)')
 
-                    # Bing ad format
-                    if '&u=' in href:
-                        try:
-                            b64 = href.split('&u=')[1].split('&')[0]
-                            b64 += '=' * (-len(b64) % 4)
-                            dec = base64.b64decode(b64).decode('utf-8', errors='ignore')
-                            if dec.startswith('http'):
-                                final_url = dec
-                        except:
-                            pass
+    # 4. Archaic HTML structure & tags
+    if re.search(r'<table[^>]+(cellpadding|cellspacing|bgcolor)', html_lower):
+        score += 20
+        flaws.append('Table-Layout Structure')
+    if '<font ' in html_lower or '<font>' in html_lower:
+        score += 20
+        flaws.append('Deprecated <font> Tags')
+    if '<center' in html_lower:
+        score += 15
+        flaws.append('Deprecated <center> Tags')
+    if '<frameset' in html_lower or '<frame ' in html_lower:
+        score += 30
+        flaws.append('Ancient HTML Framesets')
+    if '.swf' in html_lower or 'application/x-shockwave-flash' in html_lower:
+        score += 35
+        flaws.append('Dead Flash Content (.swf)')
 
-                    # Yahoo redirect /RU=
-                    elif '/RU=' in href:
-                        try:
-                            m = href.split('/RU=')[1].split('/RK=')[0]
-                            unq = urllib.parse.unquote(m)
-                            if unq.startswith('http'):
-                                final_url = unq
-                        except:
-                            pass
+    # 5. Fixed desktop width layouts (960px / 980px / 1024px)
+    if re.search(r'width\s*[:=]\s*["\']?(960|980|1000|1024)px?["\']?', html_lower):
+        score += 15
+        flaws.append('Fixed Desktop Width (960-1024px)')
 
-                    elif href.startswith('http') and 'yahoo.com' not in href and 'bing.com' not in href:
-                        final_url = href
+    # 6. Copyright year analysis
+    years = re.findall(r'(?:©|&copy;|copyright)\s*(?:\d{4}\s*[-–]\s*)?(\d{4})', html_lower)
+    if years:
+        latest = int(max(years))
+        audit['copyright_year'] = str(latest)
+        if latest <= 2015:
+            score += 30
+            flaws.append(f'Ancient Copyright (©{latest})')
+        elif latest <= 2019:
+            score += 20
+            flaws.append(f'Outdated Copyright (©{latest})')
+        elif latest <= 2022:
+            score += 10
+            flaws.append(f'Aging Copyright (©{latest})')
 
-                    if final_url:
-                        domain = domain_from_url(final_url)
-                        if is_business_domain(domain) and domain not in found_leads:
-                            name = extract_business_name(final_url, title)
-                            found_leads[domain] = {
-                                'domain': domain,
-                                'url': final_url,
-                                'title': title,
-                                'business_name': name,
-                            }
-                            page_found += 1
+    # 7. Archaic JS and Libraries
+    tech = []
+    jq_match = re.search(r'jquery[-.](1\.[0-9]+(?:\.[0-9]+)?)', html_lower)
+    if jq_match:
+        ver = jq_match.group(1)
+        tech.append(f'jQuery {ver}')
+        score += 15
+        flaws.append(f'Ancient jQuery v{ver}')
 
-                print(f'     → Nalezeno {page_found} nových unikátních domén')
-                time.sleep(1.0)
-            except Exception as e:
-                print(f'     ⚠ Chyba Yahoo: {e}')
-                break
+    if 'wp-content' in html_lower or 'wordpress' in html_lower:
+        tech.append('WordPress')
+    if 'wix.com' in html_lower:
+        tech.append('Wix')
+    if 'squarespace' in html_lower:
+        tech.append('Squarespace')
+    if 'godaddy' in html_lower:
+        tech.append('GoDaddy')
+    if 'frontpage' in html_lower:
+        tech.append('MS FrontPage')
+        score += 30
+        flaws.append('Built with MS FrontPage')
+    if 'bootstrap' in html_lower:
+        tech.append('Bootstrap')
+    if not tech:
+        tech.append('Custom/Static')
 
-    return list(found_leads.values())
+    audit['technology'] = ', '.join(tech)
+
+    # 8. Phone extraction
+    phone_matches = re.findall(r'\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}', html)
+    if phone_matches:
+        digits = re.sub(r'\D', '', phone_matches[0])
+        if len(digits) == 10 and digits[0] not in ('0', '1'):
+            audit['phone'] = f'({digits[:3]}) {digits[3:6]}-{digits[6:]}'
+
+    # Classification & final score
+    audit['outdated_score'] = score
+    audit['technical_flaws'] = ' | '.join(flaws)
+
+    if score >= 45:
+        audit['website_age_indicator'] = 'VERY_OLD_CODE'
+    elif score >= 25:
+        audit['website_age_indicator'] = 'OUTDATED'
+    elif score >= 10:
+        audit['website_age_indicator'] = 'AGING'
+    else:
+        audit['website_age_indicator'] = 'MODERN'
+
+    return audit
 
 
 # ═══════════════════════════════════════════════════════════════
-# EMAIL & PHONE EXTRACTOR
+# EMAIL EXTRACTOR
 # ═══════════════════════════════════════════════════════════════
 
 def clean_email(email):
@@ -309,7 +385,7 @@ def find_emails_from_site(base_url, timeout=7):
     email_regex = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}')
 
     try:
-        html = fetch_page(base_url, timeout=timeout)
+        html, _ = fetch_page(base_url, timeout=timeout)
         if not html:
             return []
 
@@ -319,8 +395,7 @@ def find_emails_from_site(base_url, timeout=7):
                 emails.add(c)
 
         soup = BeautifulSoup(html, 'html.parser')
-        contact_keywords = ['contact', 'about', 'reach', 'touch', 'email',
-                           'quote', 'estimate']
+        contact_keywords = ['contact', 'about', 'reach', 'touch', 'email', 'quote', 'estimate']
 
         for a in soup.find_all('a', href=True):
             href = a['href'].lower()
@@ -340,7 +415,7 @@ def find_emails_from_site(base_url, timeout=7):
             break
         visited.add(page)
         try:
-            html = fetch_page(page, timeout=timeout)
+            html, _ = fetch_page(page, timeout=timeout)
             if html:
                 for m in email_regex.findall(html):
                     c = clean_email(m)
@@ -352,108 +427,12 @@ def find_emails_from_site(base_url, timeout=7):
     return list(emails)
 
 
-def find_phone_from_html(html):
-    if not html:
-        return ''
-    phone_patterns = [
-        r'\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}',
-        r'\d{3}-\d{3}-\d{4}',
-    ]
-    for pattern in phone_patterns:
-        matches = re.findall(pattern, html)
-        for m in matches:
-            digits = re.sub(r'\D', '', m)
-            if len(digits) == 10 and digits[0] not in ('0', '1'):
-                return f'({digits[:3]}) {digits[3:6]}-{digits[6:]}'
-    return ''
-
-
 # ═══════════════════════════════════════════════════════════════
-# WEB AUDIT
+# BUSINESS DISCOVERY
 # ═══════════════════════════════════════════════════════════════
 
-def audit_website(url, timeout=7):
-    result = {
-        'has_ssl': 0,
-        'is_mobile_friendly': -1,
-        'copyright_year': '',
-        'technology': '',
-        'website_age_indicator': '',
-        'phone': '',
-    }
-
-    if not url:
-        return result
-
-    if not url.startswith('http'):
-        url = 'http://' + url
-
-    result['has_ssl'] = 1 if url.startswith('https') else 0
-
-    try:
-        html = fetch_page(url, timeout=timeout)
-        if not html:
-            return result
-
-        html_lower = html.lower()
-
-        yr_matches = re.findall(r'(?:©|&copy;|copyright)\s*(?:\d{4}\s*[-–]\s*)?(\d{4})', html_lower)
-        if yr_matches:
-            result['copyright_year'] = max(yr_matches)
-
-        result['is_mobile_friendly'] = 1 if 'viewport' in html_lower else 0
-        result['phone'] = find_phone_from_html(html)
-
-        tech = []
-        if 'wp-content' in html_lower or 'wordpress' in html_lower:
-            tech.append('WordPress')
-        if 'wix.com' in html_lower or 'wixsite' in html_lower:
-            tech.append('Wix')
-        if 'squarespace' in html_lower:
-            tech.append('Squarespace')
-        if 'godaddy' in html_lower or 'secureserver' in html_lower:
-            tech.append('GoDaddy')
-        if 'weebly' in html_lower:
-            tech.append('Weebly')
-        if '<table' in html_lower and ('cellpadding' in html_lower or 'bgcolor' in html_lower):
-            tech.append('Table-Layout (archaic)')
-        if '<frameset' in html_lower or '<frame ' in html_lower:
-            tech.append('Frames (ancient)')
-        if 'bootstrap' in html_lower:
-            tech.append('Bootstrap')
-        if not tech:
-            tech.append('Custom/Static')
-
-        result['technology'] = ', '.join(tech)
-
-        cy = result['copyright_year']
-        if cy:
-            try:
-                yr = int(cy)
-                if yr <= 2015:
-                    result['website_age_indicator'] = 'VERY_OLD'
-                elif yr <= 2019:
-                    result['website_age_indicator'] = 'OLD'
-                elif yr <= 2022:
-                    result['website_age_indicator'] = 'AGING'
-                else:
-                    result['website_age_indicator'] = 'RECENT'
-            except:
-                pass
-
-        if result['is_mobile_friendly'] == 0:
-            result['website_age_indicator'] = 'VERY_OLD'
-
-    except Exception:
-        pass
-
-    return result
-
-
-def extract_business_name(url, search_title=''):
-    if search_title:
-        name = search_title
-        # Remove URLs pasted in title
+def clean_business_name(name, domain=''):
+    if name:
         name = re.sub(r'https?://\S+', '', name)
         name = re.sub(r'›.*', '', name)
         for sep in [' | ', ' - ', ' — ', ' :: ', ' · ']:
@@ -465,10 +444,8 @@ def extract_business_name(url, search_title=''):
         if len(name) > 3 and not name.lower().startswith('http'):
             return name
 
-    domain = domain_from_url(url)
     if domain:
         base = domain.split('.')[0]
-        # Common word boundaries
         words = re.findall(r'[A-Za-z][a-z]*|[0-9]+', base)
         if words:
             return ' '.join(w.capitalize() for w in words)
@@ -476,8 +453,148 @@ def extract_business_name(url, search_title=''):
     return ''
 
 
+def is_skipped_domain(domain):
+    if not domain or len(domain) < 4:
+        return True
+    domain = domain.lower().replace('www.', '')
+    for skip in SKIP_DOMAINS:
+        if skip in domain:
+            return True
+    return False
+
+
+def search_yahoo_outdated(city, niche, max_pages=3):
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    found_leads = {}
+
+    queries = [
+        f'{niche} contractors {city}',
+        f'commercial residential {niche} {city}',
+        f'{niche} repair {city}',
+    ]
+
+    for q_idx, query in enumerate(queries[:max_pages]):
+        for p in range(max_pages):
+            b_offset = p * 10 + 1
+            encoded = urllib.parse.quote_plus(query)
+            url = f'https://search.yahoo.com/search?p={encoded}&b={b_offset}'
+            print(f'  🔍 Yahoo Search: "{query}" (p.{p+1})')
+
+            try:
+                r = session.get(url, timeout=10)
+                if r.status_code != 200:
+                    break
+
+                soup = BeautifulSoup(r.text, 'html.parser')
+                page_found = 0
+
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    title = a.get_text(strip=True)
+                    final_url = None
+
+                    if '&u=' in href:
+                        try:
+                            b64 = href.split('&u=')[1].split('&')[0]
+                            b64 += '=' * (-len(b64) % 4)
+                            dec = base64.b64decode(b64).decode('utf-8', errors='ignore')
+                            if dec.startswith('http'):
+                                final_url = dec
+                        except:
+                            pass
+                    elif '/RU=' in href:
+                        try:
+                            m = href.split('/RU=')[1].split('/RK=')[0]
+                            unq = urllib.parse.unquote(m)
+                            if unq.startswith('http'):
+                                final_url = unq
+                        except:
+                            pass
+                    elif href.startswith('http') and 'yahoo.com' not in href and 'bing.com' not in href:
+                        final_url = href
+
+                    if final_url:
+                        domain = domain_from_url(final_url)
+                        if domain and '.' in domain and not is_skipped_domain(domain) and domain not in found_leads:
+                            name = clean_business_name(title, domain)
+                            found_leads[domain] = {
+                                'domain': domain,
+                                'url': final_url,
+                                'business_name': name,
+                                'source': 'yahoo_search',
+                            }
+                            page_found += 1
+
+                print(f'     → Nalezeno {page_found} nových unikátních domén')
+                time.sleep(0.8)
+            except Exception as e:
+                print(f'     ⚠ Chyba: {e}')
+                break
+
+    return list(found_leads.values())
+
+
+def query_chicago_gov_api(niche='roofing', limit=25):
+    """Fetch registered licensed businesses from Chicago Open Data Portal."""
+    print(f'  🏛 Dotazuji oficiální City of Chicago Data Portal...')
+    url = f"https://data.cityofchicago.org/resource/r5kz-chrr.json?$limit={limit}&$where=business_activity like '%Roofing%' or business_activity like '%Home Repair%'"
+    try:
+        r = requests.get(url, timeout=12)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        leads = []
+        for d in data:
+            biz_name = d.get('doing_business_as_name') or d.get('legal_name')
+            owner = d.get('legal_name', '')
+            addr = f"{d.get('address', '')}"
+            city = d.get('city', 'CHICAGO')
+            state = d.get('state', 'IL')
+            zip_code = d.get('zip_code', '')
+            leads.append({
+                'business_name': biz_name,
+                'owner_name': owner,
+                'address': addr,
+                'city': city,
+                'state': state,
+                'zip_code': zip_code,
+                'niche': niche,
+                'source': 'chicago_gov_data',
+            })
+        print(f'  📋 Získáno {len(leads)} licencovaných firem z vládního registru')
+        return leads
+    except Exception as e:
+        print(f'  ⚠ Chyba API: {e}')
+        return []
+
+
+def find_website_for_business(business_name, city='Chicago'):
+    """Find company website via targeted search."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    query = f"{business_name} {city} contractor website"
+    url = f"https://search.yahoo.com/search?p={urllib.parse.quote_plus(query)}"
+    try:
+        r = requests.get(url, headers=headers, timeout=8)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if '/RU=' in href:
+                try:
+                    m = href.split('/RU=')[1].split('/RK=')[0]
+                    unq = urllib.parse.unquote(m)
+                    dom = domain_from_url(unq)
+                    if dom and dom not in SKIP_DOMAINS:
+                        return unq
+                except:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════
-# EXCEL EXPORT
+# EXCEL EXPORT (Focus on Outdated Code & Flaws)
 # ═══════════════════════════════════════════════════════════════
 
 def export_to_excel(conn, filepath=None):
@@ -487,41 +604,36 @@ def export_to_excel(conn, filepath=None):
     c = conn.cursor()
     c.execute('''
         SELECT business_name, owner_name, niche, email, phone, website,
-               address, city, state, zip_code, years_in_business,
-               rating, has_ssl, is_mobile_friendly, copyright_year,
-               technology, website_age_indicator, status, preview_url,
-               scan_city, scan_niche, created_at
+               outdated_score, technical_flaws, doctype, has_ssl,
+               is_mobile_friendly, copyright_year, technology,
+               website_age_indicator, address, city, state, zip_code,
+               status, created_at
         FROM leads
         ORDER BY
             CASE WHEN email != '' THEN 0 ELSE 1 END,
-            CASE website_age_indicator
-                WHEN 'VERY_OLD' THEN 0
-                WHEN 'OLD' THEN 1
-                WHEN 'AGING' THEN 2
-                ELSE 3 END,
+            outdated_score DESC,
             created_at DESC
     ''')
     rows = c.fetchall()
 
     if not filepath:
         filepath = os.path.join(os.path.dirname(DB_PATH),
-                               f'leads_export_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx')
+                               f'outdated_leads_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx')
 
     wb = Workbook()
 
     # Sheet 1: ALL LEADS
     ws = wb.active
-    ws.title = 'All Leads'
+    ws.title = 'Všechny Leady'
 
     headers = [
-        'Business Name', 'Owner / Contact', 'Industry / Niche', 'Email', 'Phone',
-        'Website', 'Address', 'City', 'State', 'ZIP',
-        'Years in Business', 'Rating', 'SSL?', 'Mobile?', 'Copyright Year',
-        'Technology', 'Age Indicator', 'Status', 'Preview URL',
-        'Scan City', 'Scan Niche', 'Found Date'
+        'Firma', 'Majitel / Zástupce', 'Obor', 'Email', 'Telefon', 'Web',
+        'Stáří Kódu (0-100)', 'Technické Vady Webu', 'Doctype', 'SSL?',
+        'Responzivní?', 'Rok Copyrightu', 'Technologie', 'Kategorie Stáří',
+        'Adresa', 'Město', 'Stát', 'ZIP', 'Status', 'Nalezeno'
     ]
 
-    header_fill = PatternFill(start_color='1B3A4B', end_color='1B3A4B', fill_type='solid')
+    header_fill = PatternFill(start_color='1A2530', end_color='1A2530', fill_type='solid')
     header_font = Font(bold=True, color='FFFFFF', size=11)
     thin_border = Border(
         left=Side(style='thin', color='DDDDDD'),
@@ -537,23 +649,28 @@ def export_to_excel(conn, filepath=None):
         cell.alignment = Alignment(horizontal='center', vertical='center')
         cell.border = thin_border
 
-    hot_fill = PatternFill(start_color='FFF3E0', end_color='FFF3E0', fill_type='solid')
-    email_font = Font(color='0066CC', underline='single')
+    hot_fill = PatternFill(start_color='FFE0B2', end_color='FFE0B2', fill_type='solid')
+    archaic_fill = PatternFill(start_color='FFCDD2', end_color='FFCDD2', fill_type='solid')
+    email_font = Font(color='0044CC', underline='single')
 
     for row_idx, row in enumerate(rows, 2):
         has_email = bool(row[3])
-        is_old = row[16] in ('VERY_OLD', 'OLD', 'AGING')
+        score = row[6] or 0
 
         for col_idx, val in enumerate(row, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.border = thin_border
             cell.alignment = Alignment(vertical='center', wrap_text=True)
-            if has_email and is_old:
+
+            if score >= 45 and has_email:
+                cell.fill = archaic_fill  # Kriticky zastaralý web s emailem!
+            elif score >= 25 and has_email:
                 cell.fill = hot_fill
+
             if col_idx == 4 and val:
                 cell.font = email_font
 
-    widths = [28, 18, 20, 28, 16, 32, 30, 14, 6, 8, 8, 6, 5, 7, 8, 18, 10, 10, 36, 16, 14, 18]
+    widths = [26, 20, 16, 26, 16, 32, 18, 36, 16, 6, 8, 8, 16, 14, 24, 12, 6, 8, 12, 16]
     for i, w in enumerate(widths, 1):
         col_letter = chr(64 + i) if i <= 26 else 'A' + chr(64 + i - 26)
         ws.column_dimensions[col_letter].width = w
@@ -561,11 +678,11 @@ def export_to_excel(conn, filepath=None):
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes = 'A2'
 
-    # Sheet 2: 🔥 HOT LEADS
-    ws2 = wb.create_sheet('🔥 Hot Leads')
-    hot_rows = [r for r in rows if r[3] and r[16] in ('VERY_OLD', 'OLD', 'AGING')]
+    # Sheet 2: 🔥 HOT LEADS (Email + Outdated Score >= 25)
+    ws2 = wb.create_sheet('🔥 Hot Outdated Leads')
+    hot_rows = [r for r in rows if r[3] and (r[6] or 0) >= 25]
 
-    hot_fill_header = PatternFill(start_color='D84315', end_color='D84315', fill_type='solid')
+    hot_fill_header = PatternFill(start_color='D32F2F', end_color='D32F2F', fill_type='solid')
     for col_idx, h in enumerate(headers, 1):
         cell = ws2.cell(row=1, column=col_idx, value=h)
         cell.font = Font(bold=True, color='FFFFFF', size=11)
@@ -574,30 +691,36 @@ def export_to_excel(conn, filepath=None):
 
     for row_idx, row in enumerate(hot_rows, 2):
         for col_idx, val in enumerate(row, 1):
-            ws2.cell(row=row_idx, column=col_idx, value=val)
+            cell = ws2.cell(row=row_idx, column=col_idx, value=val)
+            cell.border = thin_border
+            if col_idx == 4 and val:
+                cell.font = email_font
 
+    for i, w in enumerate(widths, 1):
+        col_letter = chr(64 + i) if i <= 26 else 'A' + chr(64 + i - 26)
+        ws2.column_dimensions[col_letter].width = w
+
+    ws2.auto_filter.ref = ws2.dimensions
     ws2.freeze_panes = 'A2'
 
-    # Sheet 3: 📊 STATS
-    ws3 = wb.create_sheet('📊 Stats')
+    # Sheet 3: STATS
+    ws3 = wb.create_sheet('📊 Statistiky')
     stats = [
-        ('Total Leads Found', len(rows)),
-        ('With Email', sum(1 for r in rows if r[3])),
-        ('Without Email', sum(1 for r in rows if not r[3])),
-        ('Very Old Website (<=2015)', sum(1 for r in rows if r[16] == 'VERY_OLD')),
-        ('Old Website (<=2019)', sum(1 for r in rows if r[16] == 'OLD')),
-        ('Aging Website (<=2022)', sum(1 for r in rows if r[16] == 'AGING')),
-        ('Recent Website (>=2023)', sum(1 for r in rows if r[16] == 'RECENT')),
-        ('🔥 HOT (Email + Old/VeryOld)', sum(1 for r in rows if r[3] and r[16] in ('VERY_OLD', 'OLD'))),
-        ('No SSL (Insecure HTTP)', sum(1 for r in rows if r[12] == 0)),
-        ('Not Mobile Friendly', sum(1 for r in rows if r[13] == 0)),
+        ('Celkem Prověřeno Webů', len(rows)),
+        ('S Nalezeným Emailem', sum(1 for r in rows if r[3])),
+        ('Kriticky Zastaralý Kód (Score >= 45)', sum(1 for r in rows if (r[6] or 0) >= 45)),
+        ('Zastaralý Web (Score 25-44)', sum(1 for r in rows if 25 <= (r[6] or 0) < 45)),
+        ('Moderní Web (Score < 25)', sum(1 for r in rows if (r[6] or 0) < 25)),
+        ('🔥 TOP CÍLE (Email + Zastaralý Kód)', len(hot_rows)),
+        ('Bez SSL Šifrování (HTTP)', sum(1 for r in rows if r[9] == 0)),
+        ('Neresponzivní pro Mobily', sum(1 for r in rows if r[10] == 0)),
     ]
 
     for i, (label, val) in enumerate(stats, 1):
         ws3.cell(row=i, column=1, value=label).font = Font(bold=True)
         ws3.cell(row=i, column=2, value=val)
 
-    ws3.column_dimensions['A'].width = 32
+    ws3.column_dimensions['A'].width = 36
     ws3.column_dimensions['B'].width = 10
 
     wb.save(filepath)
@@ -607,121 +730,132 @@ def export_to_excel(conn, filepath=None):
 
 
 # ═══════════════════════════════════════════════════════════════
-# PIPELINE
+# EXECUTION MODES
 # ═══════════════════════════════════════════════════════════════
 
-def run_scan(city, niche, max_pages=3):
+def run_pipeline(mode='search', city='Chicago, IL', niche='roofing', limit_or_pages=3):
     conn = init_db()
 
-    print(f'\n{"="*60}')
-    print(f'🔍 Skenuji trh: {niche.upper()} v {city.upper()}')
-    print(f'{"="*60}')
+    print(f'\n{"="*65}')
+    print(f'🚀 DETEKCE ZASTARALÝCH WEBŮ | Režim: {mode.upper()} | {niche.upper()} v {city.upper()}')
+    print(f'{"="*65}')
 
-    # Krok 1: Vyhledávání domén
-    print(f'\n── Krok 1: Sběr domén přes Yahoo Search ──')
-    raw_leads = search_yahoo(city, niche, max_pages)
-    print(f'\n  📋 Získáno celkem {len(raw_leads)} unikátních domén')
+    candidates = []
 
-    if not raw_leads:
-        print('  ⚠ Žádné domény nenalezeny.')
-        conn.close()
-        return
+    if mode == 'gov':
+        # Režim: Oficiální vládní databáze licencovaných firem Chicaga
+        gov_list = query_chicago_gov_api(niche, limit=limit_or_pages)
+        for biz in gov_list:
+            web = find_website_for_business(biz['business_name'], city=biz['city'])
+            if web:
+                dom = domain_from_url(web)
+                if not is_already_in_db(conn, dom):
+                    candidates.append({
+                        **biz,
+                        'website': web,
+                        'domain': dom,
+                    })
+    else:
+        # Režim: Yahoo organické vyhledávání
+        raw = search_yahoo_outdated(city, niche, max_pages=limit_or_pages)
+        for biz in raw:
+            dom = biz['domain']
+            if not is_already_in_db(conn, dom):
+                candidates.append({
+                    'business_name': biz['business_name'],
+                    'website': biz['url'],
+                    'domain': dom,
+                    'niche': niche,
+                    'city': city.split(',')[0].strip(),
+                    'state': city.split(',')[1].strip() if ',' in city else 'IL',
+                    'scan_city': city,
+                    'scan_niche': niche,
+                    'source': 'yahoo_search',
+                })
 
-    # Krok 2: Obohacení (audit, email, telefon)
-    print(f'\n── Krok 2: Hledání emailů & audit webů ──')
+    print(f'\n── Krok 2: Přísný technický audit kódu & sběr emailů ({len(candidates)} webů) ──')
+
     total_new = 0
-    total_with_email = 0
     total_hot = 0
 
-    for i, biz in enumerate(raw_leads):
-        domain = biz['domain']
-        url = biz['url']
+    for i, biz in enumerate(candidates):
+        url = biz['website']
+        dom = biz['domain']
         name = biz['business_name']
 
-        if is_already_in_db(conn, domain):
-            print(f'  ⏭ [{i+1}/{len(raw_leads)}] {domain} — již v DB')
-            continue
+        print(f'\n  🔎 [{i+1}/{len(candidates)}] {name} ({dom})')
 
-        print(f'  🔎 [{i+1}/{len(raw_leads)}] {name} ({domain})')
+        # 1. Detailní audit kódu
+        audit = audit_website_code(url)
+        score = audit['outdated_score']
+        flaws = audit['technical_flaws']
+        phone = audit.pop('phone', '')
 
-        # Hledání emailu
+        print(f'       🎯 Skóre zastaralosti: {score}/100 [{audit["website_age_indicator"]}]')
+        if flaws:
+            print(f'       ⚠️  Nalezené vady: {flaws}')
+        else:
+            print(f'       ✨ Moderní kód (žádné kritické vady)')
+
+        # 2. Hledání emailu
         emails = find_emails_from_site(url)
         email = emails[0] if emails else ''
+
         if email:
-            print(f'       ✅ EMAIL: {email}')
-            total_with_email += 1
+            print(f'       📬 Email: {email}')
         else:
             print(f'       ❌ Email nenalezen')
 
-        # Audit
-        audit = audit_website(url)
-        phone = audit.pop('phone', '')
-
-        age = audit.get('website_age_indicator', '')
-        mobile = '📱' if audit.get('is_mobile_friendly') == 1 else '🚫📱'
-        ssl = '🔒' if audit.get('has_ssl') else '⚠️'
-        tech = audit.get('technology', '')
-        yr = audit.get('copyright_year', '?')
-
-        print(f'       {ssl} {mobile} | Stáří: {age or "RECENT"} | Tech: {tech} | ©{yr}')
-
-        # Status
-        status = 'NEW'
-        if email and age in ('VERY_OLD', 'OLD'):
+        # 3. Status
+        if email and score >= 25:
             status = 'HOT_LEAD'
             total_hot += 1
-            print(f'       🔥🔥🔥 HOT LEAD!')
+            print(f'       🔥🔥🔥 HOT PROSPECT!')
+        elif score >= 25:
+            status = 'OUTDATED_NO_EMAIL'
         elif email:
-            status = 'EMAIL_FOUND'
-        elif age in ('VERY_OLD', 'OLD'):
-            status = 'OLD_NO_EMAIL'
+            status = 'MODERN_WITH_EMAIL'
+        else:
+            status = 'MODERN_NO_EMAIL'
 
-        lead_data = {
-            'business_name': name,
-            'niche': niche,
-            'website': url,
+        lead_record = {
+            **biz,
             'email': email,
-            'phone': phone,
-            'city': city.split(',')[0].strip() if ',' in city else city,
-            'state': city.split(',')[1].strip() if ',' in city else '',
-            'scan_city': city,
-            'scan_niche': niche,
-            'source': 'yahoo',
+            'phone': biz.get('phone') or phone,
             'status': status,
             **audit,
         }
 
-        if insert_lead(conn, lead_data):
+        if insert_lead(conn, lead_record):
             total_new += 1
 
         time.sleep(0.4)
 
-    # Log do DB
+    # Uložit do logu
     c = conn.cursor()
-    c.execute('INSERT INTO scan_log (city, niche, results_found, new_leads) VALUES (?, ?, ?, ?)',
-              (city, niche, len(raw_leads), total_new))
+    c.execute('INSERT INTO scan_log (city, niche, results_found, new_leads, hot_leads, source) VALUES (?, ?, ?, ?, ?, ?)',
+              (city, niche, len(candidates), total_new, total_hot, mode))
     conn.commit()
 
-    print(f'\n{"="*60}')
-    print(f'📊 VÝSLEDKY SKENU')
-    print(f'   Město:         {city}')
-    print(f'   Obor:          {niche}')
-    print(f'   Nové v DB:     {total_new}')
-    print(f'   S emailem:     {total_with_email}')
-    print(f'   🔥 Hot Leady:  {total_hot}')
-    print(f'{"="*60}\n')
+    print(f'\n{"="*65}')
+    print(f'📊 VÝSLEDKY AUDITU')
+    print(f'   Nové weby v DB:      {total_new}')
+    print(f'   🔥 Hot Leady (Starý kód + Email): {total_hot}')
+    print(f'{"="*65}\n')
 
     export_to_excel(conn)
     conn.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='US Local Business Lead Engine v3.1')
-    parser.add_argument('--city', type=str, help='Město a stát (např. "Chicago, IL")')
-    parser.add_argument('--niche', type=str, help='Obor (např. "roofing", "hvac")')
-    parser.add_argument('--pages', type=int, default=3, help='Počet dotazů/stránek (výchozí: 3)')
+    parser = argparse.ArgumentParser(description='US Local Business Lead Engine v4.0 (Outdated Web Precision)')
+    parser.add_argument('--mode', choices=['search', 'gov'], default='search', help='Režim: search (Yahoo) nebo gov (Chicago Gov API)')
+    parser.add_argument('--city', type=str, default='Chicago, IL', help='Město a stát (výchozí: "Chicago, IL")')
+    parser.add_argument('--niche', type=str, default='roofing', help='Obor (výchozí: "roofing")')
+    parser.add_argument('--pages', type=int, default=3, help='Počet stránek/dotazů (pro search)')
+    parser.add_argument('--limit', type=int, default=25, help='Limit firem (pro gov režim)')
     parser.add_argument('--export', action='store_true', help='Exportovat DB do Excelu')
-    parser.add_argument('--stats', action='store_true', help='Statistika DB')
+    parser.add_argument('--stats', action='store_true', help='Zobrazit statistiky DB')
 
     args = parser.parse_args()
 
@@ -738,17 +872,16 @@ def main():
         total = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM leads WHERE email != ''")
         with_email = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM leads WHERE status = 'HOT_LEAD'")
+        c.execute("SELECT COUNT(*) FROM leads WHERE outdated_score >= 25 AND email != ''")
         hot = c.fetchone()[0]
-        print(f'📊 DB Stats: {total} leadů | {with_email} s emailem | {hot} HOT')
+        c.execute("SELECT COUNT(*) FROM leads WHERE outdated_score >= 45")
+        archaic = c.fetchone()[0]
+        print(f'📊 DB Stats: {total} leadů | {with_email} s emailem | {hot} 🔥 HOT | {archaic} 💀 Archaický kód')
         conn.close()
         return
 
-    if not args.city or not args.niche:
-        parser.print_help()
-        return
-
-    run_scan(args.city, args.niche, args.pages)
+    limit_or_pages = args.limit if args.mode == 'gov' else args.pages
+    run_pipeline(args.mode, args.city, args.niche, limit_or_pages)
 
 
 if __name__ == '__main__':
