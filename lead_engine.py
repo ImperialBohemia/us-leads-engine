@@ -720,6 +720,72 @@ def sync_to_google_sheets(conn, sheet_target):
     ws_all.clear()
     ws_all.update(all_data, 'A1')
 
+    # Automatické formátování: vše zarovnat vlevo, záhlaví, auto-fit šířka sloupců
+    try:
+        format_requests = []
+        for ws, data_len in [(ws_hot, len(hot_data)), (ws_all, len(all_data))]:
+            format_requests.append({
+                'repeatCell': {
+                    'range': {
+                        'sheetId': ws.id,
+                        'startRowIndex': 0,
+                        'endRowIndex': max(data_len + 5, 20),
+                        'startColumnIndex': 0,
+                        'endColumnIndex': len(headers)
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'horizontalAlignment': 'LEFT',
+                            'verticalAlignment': 'MIDDLE',
+                            'wrapStrategy': 'OVERFLOW_CELL'
+                        }
+                    },
+                    'fields': 'userEnteredFormat(horizontalAlignment,verticalAlignment,wrapStrategy)'
+                }
+            })
+            format_requests.append({
+                'repeatCell': {
+                    'range': {
+                        'sheetId': ws.id,
+                        'startRowIndex': 0,
+                        'endRowIndex': 1,
+                        'startColumnIndex': 0,
+                        'endColumnIndex': len(headers)
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'backgroundColor': {'red': 0.1, 'green': 0.15, 'blue': 0.22},
+                            'textFormat': {'bold': True, 'foregroundColor': {'red': 1.0, 'green': 1.0, 'blue': 1.0}},
+                            'horizontalAlignment': 'LEFT'
+                        }
+                    },
+                    'fields': 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)'
+                }
+            })
+            format_requests.append({
+                'updateSheetProperties': {
+                    'properties': {
+                        'sheetId': ws.id,
+                        'gridProperties': {'frozenRowCount': 1}
+                    },
+                    'fields': 'gridProperties.frozenRowCount'
+                }
+            })
+            format_requests.append({
+                'autoResizeDimensions': {
+                    'dimensions': {
+                        'sheetId': ws.id,
+                        'dimension': 'COLUMNS',
+                        'startIndex': 0,
+                        'endIndex': len(headers)
+                    }
+                }
+            })
+        if format_requests:
+            sh.batch_update({'requests': format_requests})
+    except Exception as e:
+        print(f"  ⚠ Varování při formátování tabulky: {e}")
+
     print(f"\n✅ Úspěšně synchronizováno do Google Tabulky:")
     print(f"   URL: {sh.url}")
     print(f"   📊 Zapsáno {len(rows)} leadů s emailem ({len(hot_data)-1} 🔥 Hot Leady)")
