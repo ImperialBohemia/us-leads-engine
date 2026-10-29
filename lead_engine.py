@@ -720,8 +720,30 @@ def sync_to_google_sheets(conn, sheet_target):
     ws_all.clear()
     ws_all.update(all_data, 'A1')
 
-    # Automatické formátování: vše zarovnat vlevo, záhlaví, auto-fit šířka sloupců
+    # Automatické formátování: vše zarovnat vlevo, text wrap a optimální responzivní šířky sloupců
     try:
+        col_widths = [
+            220,  # Firma
+            150,  # Majitel
+            120,  # Obor
+            240,  # Email
+            130,  # Telefon
+            240,  # Web
+            90,   # Skóre
+            280,  # Technické vady
+            130,  # Doctype
+            70,   # SSL
+            95,   # Responzivní
+            95,   # Copyright
+            140,  # Technologie
+            120,  # Kategorie
+            180,  # Adresa
+            100,  # Město
+            60,   # Stát
+            70,   # ZIP
+            110,  # Status
+            140,  # Nalezeno
+        ]
         format_requests = []
         for ws, data_len in [(ws_hot, len(hot_data)), (ws_all, len(all_data))]:
             format_requests.append({
@@ -737,7 +759,7 @@ def sync_to_google_sheets(conn, sheet_target):
                         'userEnteredFormat': {
                             'horizontalAlignment': 'LEFT',
                             'verticalAlignment': 'MIDDLE',
-                            'wrapStrategy': 'OVERFLOW_CELL'
+                            'wrapStrategy': 'WRAP'
                         }
                     },
                     'fields': 'userEnteredFormat(horizontalAlignment,verticalAlignment,wrapStrategy)'
@@ -771,16 +793,21 @@ def sync_to_google_sheets(conn, sheet_target):
                     'fields': 'gridProperties.frozenRowCount'
                 }
             })
-            format_requests.append({
-                'autoResizeDimensions': {
-                    'dimensions': {
-                        'sheetId': ws.id,
-                        'dimension': 'COLUMNS',
-                        'startIndex': 0,
-                        'endIndex': len(headers)
+            for col_idx, width in enumerate(col_widths[:len(headers)]):
+                format_requests.append({
+                    'updateDimensionProperties': {
+                        'range': {
+                            'sheetId': ws.id,
+                            'dimension': 'COLUMNS',
+                            'startIndex': col_idx,
+                            'endIndex': col_idx + 1
+                        },
+                        'properties': {
+                            'pixelSize': width
+                        },
+                        'fields': 'pixelSize'
                     }
-                }
-            })
+                })
         if format_requests:
             sh.batch_update({'requests': format_requests})
     except Exception as e:
